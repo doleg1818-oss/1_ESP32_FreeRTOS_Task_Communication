@@ -9,54 +9,71 @@
 
 #include "esp_log.h"
 
-#define SENSOR_QUEUE_LENGTH 	5
-#define PRODUSER_PERIOD_MS		1000
-#define QUEUE_SEND_TIMEOUT_MS	100
+#define RAW_QUEUE_LENGTH 			5
+#define PROCESSED_QUEUE_LENGTH 		5
+
+#define PRODUSER_PERIOD_MS			1000
+
+#define QUEUE_SEND_TIMEOUT_MS		100
 
 #define PRODUSER_TASK_STACK_SIZE	3072
-#define CONSUMER_TASK_STACK_SIZE	3072
+#define PROCESSIND_TASK_STACK_SIZE	3072
+#define LOGGER_TASK_STACK_SIZE		3072
 
-#define PRODUSER_TASK_PRIORITY	5
-#define CONSUMER_TASK_PRIORITY	5
+#define PRODUSER_TASK_PRIORITY		5
+#define PROCESSIND_TASK_PRIORITY	5
+#define LOGGER_TASK_PRIORITY		5
+
+#define ADC_MAX_VALUE				4095U
+#define ADC_REFFERENCE_VOLUME_mv	3300U			
 
 typedef struct{
 	uint32_t sequence_number;
-	int32_t value;
+	int32_t raw_adc_value;
 	TickType_t timestamp;
-}sensor_message_t;
+}raw_sensor_message_t ;
+
+typedef struct{
+	uint32_t sequence_number;
+	uint16_t raw_adc_value;
+	uint32_t voltage_mv;
+	
+	TickType_t source_timestamp;
+	TickType_t processed_timestemp;
+}processed_sensor_message_t;
 
 static const char *TAG = "TASK_COMMUNICATION";
 
-static QueueHandle_t sensor_data_queue = NULL;
-
+static QueueHandle_t raw_data_queue = NULL;
+static QueueHandle_t processed_data_queue = NULL;
 
 static void produser_task(void *parameters)
 {
 	uint32_t sequence_number = 0;
-	int32_t simulited_value = 20;
+	int32_t simulited_adc_value = 1000;
 	
 	TickType_t last_wake_time = last_wake_time = xTaskGetTickCount();
 	ESP_LOGI(TAG, "produser_task started");
 	 
 	while(1)
 	{
-		sensor_message_t message =
+		raw_sensor_message_t raw_message =
 		{
 			.sequence_number = sequence_number,
-			.value = simulited_value,
+			.raw_adc_value = simulited_adc_value,
 			.timestamp = xTaskGetTickCount()
 		};
 		
-		BaseType_t status = xQueueSend(sensor_data_queue, &message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
+		BaseType_t status = xQueueSend(raw_data_queue, &raw_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
 		if(status == pdPASS)
 		{
 			ESP_LOGI(TAG, 
 			"Prodused sent: sequense=%" PRIu32
 			", valude=%" PRIu32
 			", timestemp=%" PRIu32,
-			message.sequence_number, 
-			message.value,
-			(uint32_t)message.timestamp);	
+			raw_message.sequence_number, 
+			raw_message.raw_adc_value,
+			(uint32_t)raw_message.timestamp);	
 		}
 		else 
 		{
@@ -64,33 +81,78 @@ static void produser_task(void *parameters)
 		}
 		
 		sequence_number++;
-		simulited_value++;
-		if(simulited_value > 30)
+		simulited_adc_value = simulited_adc_value + 250;
+		if(simulited_adc_value > 4000)
 		{
-			simulited_value = 20;
+			simulited_adc_value = 1000;
 		}		
 		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(PRODUSER_PERIOD_MS));
 	}	
 }
 
-static void consumer_task(void *parameters)
+static void processing_task(void *parameters)
 {
-	sensor_message_t received_message;
+	raw_sensor_message_t raw_message;
 	
-	ESP_LOGI(TAG, "consumer_task started");
+	ESP_LOGI(TAG, "processing_task started");
 	
 	while(1)
 	{
-		BaseType_t status = xQueueReceive(sensor_data_queue, &received_message, portMAX_DELAY);
+		BaseType_t recived_status = xQueueReceive(raw_data_queue, &raw_message, portMAX_DELAY);
+		if(recived_status == pdPASS)
+		{
+			processed_sensor_message_t processed_message = 
+			{
+				.sequence_number = raw_message.sequence_number,
+				.raw_adc_value = raw_message.raw_adc_value,
+				
+				.voltage_mv = ((uint32_t)raw_message.raw_adc_value * ADC_REFFERENCE_VOLUME_mv)/ ADC_MAX_VALUE,
+				
+				.source_timestamp = raw_message.timestamp,
+				.processed_timestemp = xTaskGetTickCount()
+			};
+			
+			BaseType_t status = xQueueSend(processed_data_queue, &processed_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
+			if(status == pdPASS)
+			{
+				ESP_LOGI(TAG, 
+					"Processing complete: sequense=%" PRIu32
+					", voltage=%" PRIu32 "mV",
+					processed_message.sequence_number, 
+					processed_message.voltage_mv
+					);
+			}
+			else 
+			{
+				ESP_LOGW(TAG, "Processing failed to send: processed queue is full");	
+			}
+		}
+	}
+}
+
+static void logger_task(void *parameters)
+{
+	processed_sensor_message_t processed_message;
+	
+	ESP_LOGI(TAG, "processing_task started");
+	
+	while(1)
+	{
+		BaseType_t status = xQueueReceive(processed_data_queue, &processed_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
 		if(status == pdPASS)
 		{
+			TickType_t processing_delay = processed_message.processed_timestemp - processed_message.source_timestamp;
+			
 			ESP_LOGI(TAG, 
-			"Prodused reseived: sequense=%" PRIu32
-			", valude=%" PRIu32
-			", timestemp=%" PRIu32,
-			received_message.sequence_number, 
-			received_message.value,
-			(uint32_t)received_message.timestamp);	
+				"Logger received: sequense=%" PRIu32
+				", raw_adc=%" PRIu16
+				", voltage=%" PRIu32 "mV"
+				", processing_delay=%" PRIu32 "ticks",
+				processed_message.sequence_number,
+				processed_message.raw_adc_value,
+				processed_message.voltage_mv,
+				(uint32_t)processing_delay
+			);
 		}
 	}
 }
@@ -100,10 +162,17 @@ void app_main(void)
 {
 	ESP_LOGI(TAG, "Aplication started");
 	
-	sensor_data_queue = xQueueCreate(SENSOR_QUEUE_LENGTH, sizeof(sensor_message_t));
-	if(sensor_data_queue == NULL)
+	raw_data_queue = xQueueCreate(RAW_QUEUE_LENGTH, sizeof(raw_sensor_message_t));
+	if(raw_data_queue == NULL)
 	{
-		ESP_LOGE(TAG, "Falied to create queue");
+		ESP_LOGE(TAG, "Falied to create raw_data_queue");
+		return;
+	}
+	
+	processed_data_queue = xQueueCreate(PROCESSED_QUEUE_LENGTH, sizeof(processed_sensor_message_t));
+	if(processed_data_queue == NULL)
+	{
+		ESP_LOGE(TAG, "Falied to create processed_data_queue");
 		return;
 	}
 	
@@ -111,20 +180,25 @@ void app_main(void)
 	if(producer_status != pdPASS)
 	{
 		ESP_LOGE(TAG,"Failed create produser_task");
-		vQueueDelete(sensor_data_queue);
-		sensor_data_queue = NULL;
 		return;	
 	}
 	
-	producer_status = xTaskCreate(consumer_task, "consumer_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
-	if(producer_status != pdPASS)
+	BaseType_t processing_status = xTaskCreate(processing_task, "processing_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
+	if(processing_status != pdPASS)
 	{
-		ESP_LOGE(TAG,"Failed create consumer_task");
+		ESP_LOGE(TAG,"Failed create processing_status");
 		return;	
 	}
 	
-	ESP_LOGI(TAG, "Tasks and queue create susesfuly");
+	BaseType_t logger_status = xTaskCreate(logger_task, "logger_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
+	if(logger_status != pdPASS)
+	{
+		ESP_LOGE(TAG,"Failed create logger_task");
+		return;	
+	}
 	
+	
+	ESP_LOGI(TAG, "Tasks and queue create susesfuly");	
 }
 
 
