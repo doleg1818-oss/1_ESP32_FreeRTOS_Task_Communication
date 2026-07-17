@@ -8,6 +8,8 @@
 #include "freertos/queue.h"
 
 #include "esp_log.h"
+#include "portmacro.h"
+#include "inttypes.h" 
 
 #define RAW_QUEUE_LENGTH 			5
 #define PROCESSED_QUEUE_LENGTH 		5
@@ -26,6 +28,16 @@
 
 #define ADC_MAX_VALUE				4095U
 #define ADC_REFFERENCE_VOLUME_mv	3300U			
+
+#define MONITORING_PERION_MS 		5000
+#define MONITOR_TASK_STACK_SIZE		3072
+#define MONITOR_TASK_PRIORITY		4
+
+#define PRODUSER_ACTIVITY_BIT		(1UL << 0)
+#define PROCESSING_ACTIVITY_BIT		(1UL << 1)
+#define LOGGER_ACTIVITY_BIT			(1UL << 2)
+
+#define ALL_ACTIVITY_BITS 			(PRODUSER_ACTIVITY_BIT | PROCESSING_ACTIVITY_BIT | LOGGER_ACTIVITY_BIT)
 
 typedef struct{
 	uint32_t sequence_number;
@@ -47,12 +59,32 @@ static const char *TAG = "TASK_COMMUNICATION";
 static QueueHandle_t raw_data_queue = NULL;
 static QueueHandle_t processed_data_queue = NULL;
 
+static TaskHandle_t monitor_task_handle = NULL;
+
+
+
+static void notify_monitor(uint32_t activity_bit)
+{
+	if(monitor_task_handle == NULL)
+	{
+		ESP_LOGW(TAG, "Monitor task handle is null");
+		return;
+	}
+	
+	BaseType_t status = xTaskNotify(monitor_task_handle, activity_bit, eSetBits);
+	if(status != pdPASS)
+	{
+		ESP_LOGW(TAG, "Failed to monitor, bit=0x%" PRIX32, activity_bit);
+	}
+}
+
+
 static void produser_task(void *parameters)
 {
 	uint32_t sequence_number = 0;
 	int32_t simulited_adc_value = 1000;
 	
-	TickType_t last_wake_time = last_wake_time = xTaskGetTickCount();
+	TickType_t last_wake_time = xTaskGetTickCount();
 	ESP_LOGI(TAG, "produser_task started");
 	 
 	while(1)
@@ -74,6 +106,7 @@ static void produser_task(void *parameters)
 			raw_message.sequence_number, 
 			raw_message.raw_adc_value,
 			(uint32_t)raw_message.timestamp);	
+			notify_monitor(PRODUSER_ACTIVITY_BIT);
 		}
 		else 
 		{
@@ -121,6 +154,8 @@ static void processing_task(void *parameters)
 					processed_message.sequence_number, 
 					processed_message.voltage_mv
 					);
+					
+					notify_monitor(PROCESSING_ACTIVITY_BIT);
 			}
 			else 
 			{
@@ -134,7 +169,7 @@ static void logger_task(void *parameters)
 {
 	processed_sensor_message_t processed_message;
 	
-	ESP_LOGI(TAG, "processing_task started");
+	ESP_LOGI(TAG, "logger_task started");
 	
 	while(1)
 	{
@@ -153,10 +188,57 @@ static void logger_task(void *parameters)
 				processed_message.voltage_mv,
 				(uint32_t)processing_delay
 			);
+			notify_monitor(LOGGER_ACTIVITY_BIT);
 		}
 	}
 }
 
+static void monitor_task(void *parameters)
+{
+	TickType_t last_wake_time = xTaskGetTickCount();
+	
+	ESP_LOGI(TAG, "monitor_task started");
+	
+	while(1)
+	{
+		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(MONITORING_PERION_MS));
+		
+		uint32_t activity_bits = 0;
+		BaseType_t status = xTaskNotifyWait(0, UINT32_MAX, &activity_bits, 0);
+		
+		if(status != pdTRUE)
+		{
+			ESP_LOGW(TAG, "MONITOR: No task activity notifications received");
+			continue;
+		}
+		ESP_LOGI(TAG, 
+			"Monitor: bits:0x%" PRIX32
+			", producer = %s"
+			", processing = %s"
+			", logger = %s",
+			activity_bits,
+			(activity_bits & PRODUSER_ACTIVITY_BIT)
+				? "ACTIVE"
+				: "MISSING",
+			(activity_bits & PROCESSING_ACTIVITY_BIT)
+				? "ACTIVE"
+				: "MISSING",
+			(activity_bits & LOGGER_ACTIVITY_BIT)
+				? "ACTIVE"
+				: "MISSING"
+		);
+		if((activity_bits & ALL_ACTIVITY_BITS) == ALL_ACTIVITY_BITS)
+		{
+			ESP_LOGI(TAG, "MONITOR: All task are active");
+		}
+		else 
+		{
+			ESP_LOGI(TAG, "MONITOR: one or more tasks did not report activity");
+		}
+		
+	
+	}
+}
 
 void app_main(void)
 {
@@ -174,6 +256,13 @@ void app_main(void)
 	{
 		ESP_LOGE(TAG, "Falied to create processed_data_queue");
 		return;
+	}
+	
+	BaseType_t monitor_status = xTaskCreate(monitor_task, "monitor_task", MONITOR_TASK_STACK_SIZE, NULL, MONITOR_TASK_PRIORITY, &monitor_task_handle);
+	if(monitor_status != pdPASS)
+	{
+		ESP_LOGE(TAG,"Failed create monitor_status");
+		return;	
 	}
 	
 	BaseType_t producer_status = xTaskCreate(produser_task, "produser_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
@@ -196,6 +285,9 @@ void app_main(void)
 		ESP_LOGE(TAG,"Failed create logger_task");
 		return;	
 	}
+	
+
+	
 	
 	
 	ESP_LOGI(TAG, "Tasks and queue create susesfuly");	
