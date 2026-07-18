@@ -12,7 +12,7 @@
 #include "inttypes.h" 
 
 #define RAW_QUEUE_LENGTH 			5
-#define PROCESSED_QUEUE_LENGTH 		3
+#define PROCESSED_QUEUE_LENGTH 		1
 
 #define PRODUSER_PERIOD_MS			1000
 
@@ -41,12 +41,6 @@
 
 #define LOGGER_WORK_DELAY_MS		3000
 
-typedef enum{
-	QUEUE_WRITE_OK = 0,
-	QUEUE_WRITE_REPLACED_OLDEST,
-	QUEUE_WRITE_FAILED
-}queue_write_result_t;
-
 typedef struct{
 	uint32_t sequence_number;
 	int32_t raw_adc_value;
@@ -70,36 +64,6 @@ static QueueHandle_t processed_data_queue = NULL;
 static TaskHandle_t monitor_task_handle = NULL;
 
 
-static queue_write_result_t processed_queue_send_drop_oldest(processed_sensor_message_t *new_message, processed_sensor_message_t *dropped_message)
-{
-	// 1. try save message into queue without waiting.
-	BaseType_t send_status = xQueueSend(processed_data_queue, new_message, 0);
-	if(send_status == pdPASS)
-	{
-		return QUEUE_WRITE_OK;
-	}
-	// 2. the queue is full. take the oldest element from queue
-	BaseType_t recived_status = xQueueReceive(processed_data_queue, dropped_message, 0);
-	if(recived_status == pdPASS)
-	{
-		send_status = xQueueSend(processed_data_queue, new_message, 0);
-		
-		if(send_status == pdPASS)
-		{
-			return QUEUE_WRITE_REPLACED_OLDEST;
-		}
-	}
-	else
-	{
-		// 3.Logger can be read element beatvean first  xQueueSend() and xQueueReceive()
-		BaseType_t send_status = xQueueSend(processed_data_queue, new_message, 0);
-		if(send_status == pdPASS)
-		{
-			return QUEUE_WRITE_OK;
-		}
-	}
-	return QUEUE_WRITE_FAILED;
-}
 static void notify_monitor(uint32_t activity_bit)
 {
 	static const char *TAG = "NITIFY MONITOR";
@@ -194,19 +158,14 @@ static void processing_task(void *parameters)
 				
 			.source_timestamp = raw_message.timestamp,
 			.processed_timestemp = xTaskGetTickCount()
-		};
+		};	
 		
-		TickType_t send_start_ticlk = xTaskGetTickCount();
+		BaseType_t owerwrite_status = xQueueOverwrite(processed_data_queue, &processed_message);
 		
-		//BaseType_t send_status = xQueueSend(processed_data_queue, &processed_message, portMAX_DELAY);
-		
-		processed_sensor_message_t dropped_message = {0};
-		queue_write_result_t write_result = processed_queue_send_drop_oldest(&processed_message, &dropped_message);
-		
-		UBaseType_t messages_writing = uxQueueMessagesWaiting(processed_data_queue);
-		
-		if(write_result == QUEUE_WRITE_OK)
+		if(owerwrite_status == pdPASS)
 		{
+			UBaseType_t messages_writing = uxQueueMessagesWaiting(processed_data_queue);
+			
 			ESP_LOGI(TAG, 
 			"Processing sent: sequense=%" PRIu32
 			", voltage=%" PRIu32 "mV"
@@ -217,21 +176,8 @@ static void processing_task(void *parameters)
 			(unsigned int)PROCESSED_QUEUE_LENGTH);
 			
 			notify_monitor(PROCESSING_ACTIVITY_BIT);
-		}
-		else if(write_result == QUEUE_WRITE_REPLACED_OLDEST)
-		{
-			ESP_LOGW(TAG, 
-			"Queue is full: dropped oldest sequense=%" PRIu32
-			", inserted  sequence=%" PRIu32 
-			", queue=%u/%u",
-			dropped_message.sequence_number, 
-			processed_message.sequence_number,
-			(unsigned int)messages_writing,
-			(unsigned int)PROCESSED_QUEUE_LENGTH);
-			
-			notify_monitor(PROCESSING_ACTIVITY_BIT);
-		}
-		else
+		} 
+		else 
 		{
 			ESP_LOGE(TAG, "Failet to write processed sequense=%" PRIu32,
 				processed_message.sequence_number);
