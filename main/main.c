@@ -12,7 +12,7 @@
 #include "inttypes.h" 
 
 #define RAW_QUEUE_LENGTH 			5
-#define PROCESSED_QUEUE_LENGTH 		5
+#define PROCESSED_QUEUE_LENGTH 		3
 
 #define PRODUSER_PERIOD_MS			1000
 
@@ -39,6 +39,10 @@
 
 #define ALL_ACTIVITY_BITS 			(PRODUSER_ACTIVITY_BIT | PROCESSING_ACTIVITY_BIT | LOGGER_ACTIVITY_BIT)
 
+#define LOGGER_WORK_DELAY_MS		3000
+
+
+
 typedef struct{
 	uint32_t sequence_number;
 	int32_t raw_adc_value;
@@ -62,9 +66,9 @@ static QueueHandle_t processed_data_queue = NULL;
 static TaskHandle_t monitor_task_handle = NULL;
 
 
-
 static void notify_monitor(uint32_t activity_bit)
 {
+	static const char *TAG = "NITIFY MONITOR";
 	if(monitor_task_handle == NULL)
 	{
 		ESP_LOGW(TAG, "Monitor task handle is null");
@@ -81,6 +85,8 @@ static void notify_monitor(uint32_t activity_bit)
 
 static void produser_task(void *parameters)
 {
+	static const char *TAG = "PRODUSER_TASK";
+	
 	uint32_t sequence_number = 0;
 	int32_t simulited_adc_value = 1000;
 	
@@ -106,6 +112,7 @@ static void produser_task(void *parameters)
 			raw_message.sequence_number, 
 			raw_message.raw_adc_value,
 			(uint32_t)raw_message.timestamp);	
+			
 			notify_monitor(PRODUSER_ACTIVITY_BIT);
 		}
 		else 
@@ -125,71 +132,129 @@ static void produser_task(void *parameters)
 
 static void processing_task(void *parameters)
 {
+	static const char *TAG = "PROCESSING TASK";
+	
 	raw_sensor_message_t raw_message;
+	
+	uint32_t dropped_message = 0;
 	
 	ESP_LOGI(TAG, "processing_task started");
 	
 	while(1)
 	{
 		BaseType_t recived_status = xQueueReceive(raw_data_queue, &raw_message, portMAX_DELAY);
-		if(recived_status == pdPASS)
+		if(recived_status != pdPASS)
 		{
-			processed_sensor_message_t processed_message = 
-			{
-				.sequence_number = raw_message.sequence_number,
-				.raw_adc_value = raw_message.raw_adc_value,
+			continue;
+		}
+		
+		processed_sensor_message_t processed_message = 
+		{
+			.sequence_number = raw_message.sequence_number,
+			.raw_adc_value = raw_message.raw_adc_value,
 				
-				.voltage_mv = ((uint32_t)raw_message.raw_adc_value * ADC_REFFERENCE_VOLUME_mv)/ ADC_MAX_VALUE,
+			.voltage_mv = ((uint32_t)raw_message.raw_adc_value * ADC_REFFERENCE_VOLUME_mv)/ ADC_MAX_VALUE,
 				
-				.source_timestamp = raw_message.timestamp,
-				.processed_timestemp = xTaskGetTickCount()
-			};
+			.source_timestamp = raw_message.timestamp,
+			.processed_timestemp = xTaskGetTickCount()
+		};
+		
+		
+		BaseType_t send_status = xQueueSend(processed_data_queue, &processed_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
+		if(send_status == pdPASS)
+		{
+			UBaseType_t meaages_waiting = uxQueueMessagesWaiting(processed_data_queue);
+				
+			ESP_LOGI(TAG, 
+			"Processing complete: sequense=%" PRIu32
+			", voltage=%" PRIu32 "mV"
+			", queue=%u/%u",
+			processed_message.sequence_number, 
+			processed_message.voltage_mv,
+			(unsigned int)meaages_waiting,
+			(unsigned int)PROCESSED_QUEUE_LENGTH);	
 			
-			BaseType_t status = xQueueSend(processed_data_queue, &processed_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
-			if(status == pdPASS)
-			{
-				ESP_LOGI(TAG, 
-					"Processing complete: sequense=%" PRIu32
-					", voltage=%" PRIu32 "mV",
-					processed_message.sequence_number, 
-					processed_message.voltage_mv
-					);
-					
-					notify_monitor(PROCESSING_ACTIVITY_BIT);
-			}
-			else 
-			{
-				ESP_LOGW(TAG, "Processing failed to send: processed queue is full");	
-			}
+			notify_monitor(PROCESSING_ACTIVITY_BIT);
+		}
+		else 
+		{
+			dropped_message++;
+			
+			ESP_LOGI(TAG, 
+			"Processed queue full: dropped sequense=%" PRIu32
+			", total_dropped=%" PRIu32,
+			processed_message.sequence_number, 
+			dropped_message);		
 		}
 	}
 }
 
 static void logger_task(void *parameters)
 {
+	static const char *TAG = "LOGGER TASK";
+	
 	processed_sensor_message_t processed_message;
+	
+	uint32_t expexted_sequence_number = 0;
+	bool sequence_initialized = false;
 	
 	ESP_LOGI(TAG, "logger_task started");
 	
 	while(1)
 	{
 		BaseType_t status = xQueueReceive(processed_data_queue, &processed_message, pdMS_TO_TICKS(QUEUE_SEND_TIMEOUT_MS));
-		if(status == pdPASS)
+		if(status != pdPASS)
 		{
-			TickType_t processing_delay = processed_message.processed_timestemp - processed_message.source_timestamp;
-			
-			ESP_LOGI(TAG, 
-				"Logger received: sequense=%" PRIu32
-				", raw_adc=%" PRIu16
-				", voltage=%" PRIu32 "mV"
-				", processing_delay=%" PRIu32 "ticks",
-				processed_message.sequence_number,
-				processed_message.raw_adc_value,
-				processed_message.voltage_mv,
-				(uint32_t)processing_delay
-			);
-			notify_monitor(LOGGER_ACTIVITY_BIT);
+			continue;
 		}
+		if(sequence_initialized == false)
+		{
+			expexted_sequence_number = processed_message.sequence_number;
+			sequence_initialized = true;
+		}
+		
+		if(processed_message.sequence_number != expexted_sequence_number)
+		{
+			if(processed_message.sequence_number > expexted_sequence_number)
+			{
+				uint32_t lost_messages = processed_message.sequence_number - expexted_sequence_number;
+				
+				ESP_LOGI(TAG,
+					"Logger detected seqence gup:"
+					" expected=%" PRIu32
+					" received=%" PRIu32
+					" lost=%" PRIu32,
+					expexted_sequence_number,
+					processed_message.sequence_number,
+					lost_messages);
+			}
+			else 
+			{
+				ESP_LOGW(TAG,
+					"Logger detected old or out-of-order message:"
+					" expected=%" PRIu32
+					" received=%" PRIu32,
+					expexted_sequence_number,
+					processed_message.sequence_number);
+			}
+		}
+		expexted_sequence_number = processed_message.sequence_number + 1;
+		
+		TickType_t processing_delay = processed_message.processed_timestemp - processed_message.source_timestamp;
+		
+		ESP_LOGI(TAG,
+			"Logger received: sequence=%" PRIu32
+			", raw_adc=%" PRIu16
+			", voltage=%" PRIu32 "mV"
+			", processing delay=%" PRIu32 " ricks",
+			processed_message.sequence_number,
+			processed_message.raw_adc_value,
+			processed_message.voltage_mv,
+			(uint32_t)processing_delay
+		);
+		notify_monitor(LOGGER_ACTIVITY_BIT);
+		
+		vTaskDelay(pdMS_TO_TICKS(LOGGER_WORK_DELAY_MS));
 	}
 }
 
@@ -197,6 +262,7 @@ static void monitor_task(void *parameters)
 {
 	TickType_t last_wake_time = xTaskGetTickCount();
 	
+	static const char *TAG = "MONITOR TASK";
 	ESP_LOGI(TAG, "monitor_task started");
 	
 	while(1)
