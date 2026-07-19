@@ -39,7 +39,12 @@
 
 #define ALL_ACTIVITY_BITS 			(PRODUSER_ACTIVITY_BIT | PROCESSING_ACTIVITY_BIT | LOGGER_ACTIVITY_BIT)
 
+#define NOTIFICATION_COUNTER_PERIOD			5000
+#define NOTIFICATION_COUNTER_STASK_SIZE		2028
+#define NOTIFICATION_COUNTER_PRIORITY		4
+
 #define LOGGER_WORK_DELAY_MS		3000
+
 
 typedef struct{
 	uint32_t sequence_number;
@@ -62,7 +67,23 @@ static QueueHandle_t raw_data_queue = NULL;
 static QueueHandle_t processed_data_queue = NULL;
 
 static TaskHandle_t monitor_task_handle = NULL;
+static TaskHandle_t notification_counter_task_handle = NULL;
 
+static void notify_counter_task(void) 
+{
+	static const char *TAG = "NOTIFY COUNTER TASK";
+	
+	if(notification_counter_task_handle == NULL)
+	{
+		ESP_LOGW(TAG, "notification counter task handle is NULL");
+		return;
+	}
+	BaseType_t status = xTaskNotifyGive(notification_counter_task_handle);
+	if(status != pdPASS)
+	{
+		ESP_LOGW(TAG, "Failed increment notification counter");
+	}
+}
 
 static void notify_monitor(uint32_t activity_bit)
 {
@@ -116,6 +137,8 @@ static void produser_task(void *parameters)
 			(unsigned int)RAW_QUEUE_LENGTH);	
 			
 			notify_monitor(PRODUSER_ACTIVITY_BIT);
+			
+			notify_counter_task();
 		}
 		else 
 		{
@@ -297,10 +320,24 @@ static void monitor_task(void *parameters)
 		{
 			ESP_LOGI(TAG, "MONITOR: one or more tasks did not report activity");
 		}
-		
-	
 	}
 }
+static void nitification_counter_task(void *parameters)
+{
+	static const char *TAG = "NOTIFICATION COUNTER TASK";
+	
+	TickType_t last_wake_time = xTaskGetTickCount();
+	
+	ESP_LOGI(TAG, "nitification_counter_task started");
+	
+	while(1)
+	{
+		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(NOTIFICATION_COUNTER_PERIOD));
+		uint32_t produser_ivent = ulTaskNotifyTake(pdTRUE, 0);
+		ESP_LOGI(TAG, "Producer events during last period: %" PRIu32, produser_ivent);	
+	}
+}
+
 
 void app_main(void)
 {
@@ -324,6 +361,13 @@ void app_main(void)
 	if(monitor_status != pdPASS)
 	{
 		ESP_LOGE(TAG,"Failed create monitor_status");
+		return;	
+	}
+	
+	BaseType_t notification_counter_task_handle_status = xTaskCreate(nitification_counter_task, "nitification_counter_task", NOTIFICATION_COUNTER_STASK_SIZE, NULL, NOTIFICATION_COUNTER_PRIORITY, &notification_counter_task_handle);
+	if(notification_counter_task_handle_status != pdPASS)
+	{
+		ESP_LOGE(TAG,"Failed create nitification_counter_task");
 		return;	
 	}
 	
