@@ -11,6 +11,11 @@
 #include "portmacro.h"
 #include "inttypes.h" 
 
+#include "esp_system.h"
+#include "string.h"
+#include "sdkconfig.h"
+#include "esp_cpu.h"
+
 #define RAW_QUEUE_LENGTH 			5
 #define PROCESSED_QUEUE_LENGTH 		1
 
@@ -45,6 +50,10 @@
 
 #define LOGGER_WORK_DELAY_MS		3000
 
+#define CPU_STATS_PERIOD_MS			10000
+#define CPU_STATS_TASK_STACK_SIZE	4096
+#define CPU_STATS_TASK_PRIORITY		2
+#define CPU_STATS_BUFFER_SIZE		4096
 
 typedef struct{
 	uint32_t sequence_number;
@@ -66,8 +75,105 @@ static const char *TAG = "TASK_COMMUNICATION";
 static QueueHandle_t raw_data_queue = NULL;
 static QueueHandle_t processed_data_queue = NULL;
 
+
+static TaskHandle_t produser_task_handle = NULL;
+static TaskHandle_t processing_status_task_handle = NULL;
+static TaskHandle_t logger_status_task_handle = NULL;
 static TaskHandle_t monitor_task_handle = NULL;
 static TaskHandle_t notification_counter_task_handle = NULL;
+static TaskHandle_t cpu_status_task_handle = NULL;
+
+char cpu_status_buffer[CPU_STATS_BUFFER_SIZE];
+
+
+static void log_task_stack(const char *task_name, TaskHandle_t task_handle)
+{
+	if(task_handle == NULL)
+	{
+		ESP_LOGW("RESURCE_MONITOR", "%s handle is NULL", task_name);
+		return;
+	}
+	UBaseType_t minimum_free_size = uxTaskGetStackHighWaterMark(task_handle);
+	ESP_LOGI("RESURCE_MONITOR", "%s minimum free stack: %u bytes", task_name, (unsigned int)minimum_free_size);
+	
+	ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
+}
+static void log_system_resources(void)
+{
+	//uint32_t free_heap = esp_get_free_heap_size();
+	size_t total_haep = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+	size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+	size_t minimum_free_haep = esp_get_minimum_free_heap_size();
+	size_t used_heap = total_haep - free_heap;
+	
+	UBaseType_t raw_message = uxQueueMessagesWaiting(raw_data_queue);
+	UBaseType_t raw_spases = uxQueueSpacesAvailable(raw_data_queue);
+	UBaseType_t processed_message = uxQueueMessagesWaiting(processed_data_queue);
+	UBaseType_t processed_spases = uxQueueSpacesAvailable(processed_data_queue);
+	
+	ESP_LOGI("RESURCE_MONITOR",
+		" Heap: Total Heap =%u, Free Heap: =%u bytes, Used Heap =%u, minimum free heap =%u",
+		(unsigned int)total_haep,
+		(unsigned int)free_heap,
+		(unsigned int)used_heap,
+		(unsigned int)minimum_free_haep);
+	
+	
+	ESP_LOGI("RESURCE_MONITOR",
+		"Raw queue: messages=%u, free=%u, capasity=%u",
+		(unsigned int)raw_message,
+		(unsigned int)raw_spases,
+		(unsigned int)RAW_QUEUE_LENGTH);
+	
+		ESP_LOGI("RESURCE_MONITOR",
+		"Processing queue: messages=%u, free=%u, capasity=%u",
+		(unsigned int)processed_message,
+		(unsigned int)processed_spases,
+		(unsigned int)PROCESSED_QUEUE_LENGTH);
+	
+		log_task_stack("produser_task", produser_task_handle);
+		log_task_stack("processing_status_task", processing_status_task_handle);
+		log_task_stack("logger_status_task", logger_status_task_handle);
+		log_task_stack("produser_task", produser_task_handle);
+		log_task_stack("monitor_task", monitor_task_handle);
+		log_task_stack("notification_counter_task", notification_counter_task_handle);
+		log_task_stack("cpu_status_task", cpu_status_task_handle);
+		
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
+}
+static void cpu_status_task(void *parametrs)
+{
+	static const char *TAG = "CPU_STATUS";
+	TickType_t last_weak_time = xTaskGetTickCount();
+	ESP_LOGI(TAG, "cpu_status_task started");
+	
+	while(1)
+	{
+		vTaskDelayUntil(&last_weak_time, pdMS_TO_TICKS(CPU_STATS_PERIOD_MS));
+		memset(cpu_status_buffer, 0, sizeof(cpu_status_buffer));
+		
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && \
+    CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS && \
+    CONFIG_FREERTOS_USE_TRACE_FACILITY
+    
+    vTaskGetRunTimeStats(cpu_status_buffer);
+    ESP_LOGI(TAG, 
+    	"\n"
+    	"Task runtime statistics:\n"
+    	"Task name\tRuntime\tCPU %%\n"
+    	"%s",
+    	cpu_status_buffer
+    );
+#else
+    ESP_LOGE(TAG, "FreeRTOS runtime statistics are disabled")
+#endif	
+	}
+	
+	ESP_LOGI(TAG, "WORK ON CORE %d",
+	esp_cpu_get_core_id());
+}
 
 static void notify_counter_task(void) 
 {
@@ -99,6 +205,8 @@ static void notify_monitor(uint32_t activity_bit)
 	{
 		ESP_LOGW(TAG, "Failed to monitor, bit=0x%" PRIX32, activity_bit);
 	}
+	ESP_LOGI(TAG, "WORK ON CORE %d",
+	esp_cpu_get_core_id());
 }
 
 static void produser_task(void *parameters)
@@ -150,7 +258,11 @@ static void produser_task(void *parameters)
 		if(simulited_adc_value > 4000)
 		{
 			simulited_adc_value = 1000;
-		}		
+		}	
+		
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());	
+		
 		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(PRODUSER_PERIOD_MS));
 	}	
 }
@@ -205,6 +317,8 @@ static void processing_task(void *parameters)
 			ESP_LOGE(TAG, "Failet to write processed sequense=%" PRIu32,
 				processed_message.sequence_number);
 		}
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
 	}
 }
 
@@ -273,6 +387,9 @@ static void logger_task(void *parameters)
 		);
 		notify_monitor(LOGGER_ACTIVITY_BIT);
 		
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
+		
 		vTaskDelay(pdMS_TO_TICKS(LOGGER_WORK_DELAY_MS));
 	}
 }
@@ -320,6 +437,10 @@ static void monitor_task(void *parameters)
 		{
 			ESP_LOGI(TAG, "MONITOR: one or more tasks did not report activity");
 		}
+		log_system_resources();
+		
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
 	}
 }
 static void nitification_counter_task(void *parameters)
@@ -334,7 +455,10 @@ static void nitification_counter_task(void *parameters)
 	{
 		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(NOTIFICATION_COUNTER_PERIOD));
 		uint32_t produser_ivent = ulTaskNotifyTake(pdTRUE, 0);
-		ESP_LOGI(TAG, "Producer events during last period: %" PRIu32, produser_ivent);	
+		ESP_LOGI(TAG, "Producer events during last period: %" PRIu32, produser_ivent);
+			
+		ESP_LOGI(TAG, "WORK ON CORE %d",
+		esp_cpu_get_core_id());
 	}
 }
 
@@ -357,6 +481,13 @@ void app_main(void)
 		return;
 	}
 	
+	BaseType_t cpu_status_status = xTaskCreate(cpu_status_task, "cpu_status_task", MONITOR_TASK_STACK_SIZE, NULL, MONITOR_TASK_PRIORITY, &cpu_status_task_handle);
+	if(cpu_status_status != pdPASS)
+	{
+		ESP_LOGE(TAG,"Failed create cpu_status_task_handle");
+		return;	
+	}
+	
 	BaseType_t monitor_status = xTaskCreate(monitor_task, "monitor_task", MONITOR_TASK_STACK_SIZE, NULL, MONITOR_TASK_PRIORITY, &monitor_task_handle);
 	if(monitor_status != pdPASS)
 	{
@@ -371,21 +502,21 @@ void app_main(void)
 		return;	
 	}
 	
-	BaseType_t producer_status = xTaskCreate(produser_task, "produser_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
+	BaseType_t producer_status = xTaskCreate(produser_task, "produser_task", PRODUSER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, &produser_task_handle);
 	if(producer_status != pdPASS)
 	{
 		ESP_LOGE(TAG,"Failed create produser_task");
 		return;	
 	}
 	
-	BaseType_t processing_status = xTaskCreate(processing_task, "processing_task", PROCESSIND_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
+	BaseType_t processing_status = xTaskCreate(processing_task, "processing_task", PROCESSIND_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, &processing_status_task_handle);
 	if(processing_status != pdPASS)
 	{
 		ESP_LOGE(TAG,"Failed create processing_status");
 		return;	
 	}
 	
-	BaseType_t logger_status = xTaskCreate(logger_task, "logger_task", LOGGER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, NULL);
+	BaseType_t logger_status = xTaskCreate(logger_task, "logger_task", LOGGER_TASK_STACK_SIZE, NULL, PRODUSER_TASK_PRIORITY, &logger_status_task_handle);
 	if(logger_status != pdPASS)
 	{
 		ESP_LOGE(TAG,"Failed create logger_task");
